@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime
+import os
 
 import pandas as pd
 import pandas_ta as ta
@@ -9,8 +10,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # CONFIG
-import os
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8669805705:AAEeEawbQ5U5d-G2hJGV-fJjHO1r_1IVVJE")
 WATCH_INTERVAL = 60 * 60
 DEFAULT_TF = "1d"
 
@@ -123,29 +123,68 @@ def analyse(df):
     ema200 = float(latest["ema200"])
     macd_val = float(latest["macd"])
     macd_sig = float(latest["macd_signal"])
+    bb_up = float(latest["bb_up"])
+    bb_low = float(latest["bb_low"])
+    bb_mid = float(latest["bb_mid"])
 
     bullish_ema = ema20 > ema50 > ema200
     bearish_ema = ema20 < ema50 < ema200
     macd_bull = macd_val > macd_sig
     macd_bear = macd_val < macd_sig
 
+    price_above_ema = price > ema20 > ema50
+    price_below_ema = price < ema20 < ema50
+
+    rsi_bullish = 50 < rsi < 75
+    rsi_bearish = rsi < 50
+    rsi_overbought = rsi > 75
+    rsi_oversold = rsi < 25
+
+    bb_squeeze = (bb_up - bb_low) / bb_mid < 0.1
+    price_near_bb_low = price < bb_low * 1.02
+    price_near_bb_up = price > bb_up * 0.98
+
     score = 0
+
     if bullish_ema:
         score += 2
     elif bearish_ema:
         score -= 2
-    if macd_bull:
+
+    if macd_bull and macd_val > 0:
+        score += 2
+    elif macd_bull:
         score += 1
+    elif macd_bear and macd_val < 0:
+        score -= 2
     elif macd_bear:
         score -= 1
-    if bullish_ema and 50 < rsi < 70:
+
+    if rsi_bullish and bullish_ema:
         score += 1
-    elif bearish_ema and rsi < 50:
+    elif rsi_oversold:
+        score += 1
+    elif rsi_bearish and bearish_ema:
+        score -= 1
+    elif rsi_overbought:
         score -= 1
 
-    if score >= 3:
+    if price_above_ema:
+        score += 1
+    elif price_below_ema:
+        score -= 1
+
+    if price_near_bb_low and bullish_ema:
+        score += 1
+    elif price_near_bb_up and bearish_ema:
+        score -= 1
+
+    max_score = 7
+    confidence = round((abs(score) / max_score) * 100)
+
+    if score >= 4:
         direction = "LONG 📈"
-    elif score <= -3:
+    elif score <= -4:
         direction = "SHORT 📉"
     else:
         direction = "NEUTRAL ⚖️"
@@ -173,6 +212,7 @@ def analyse(df):
         "price": round(price, 4),
         "direction": direction,
         "score": score,
+        "confidence": confidence,
         "rsi": round(rsi, 2),
         "atr": round(atr, 4),
         "ema20": round(ema20, 4),
@@ -184,13 +224,14 @@ def analyse(df):
         "tp3": tp3,
         "rr": rr,
         "macd_hist": round(float(latest["macd_hist"]), 4),
-        "bb_low": round(float(latest["bb_low"]), 4),
-        "bb_up": round(float(latest["bb_up"]), 4),
+        "bb_low": round(bb_low, 4),
+        "bb_up": round(bb_up, 4),
     }
 
 
 def format_signal(symbol, tf, sig):
     stars = "⭐" * abs(sig["score"])
+    confidence_bar = "🟩" * (sig["confidence"] // 20) + "⬜" * (5 - sig["confidence"] // 20)
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     text = (
@@ -198,7 +239,8 @@ def format_signal(symbol, tf, sig):
         f"<b>{symbol}/USDT</b> | {tf}\n"
         f"🕒 {now}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 <b>Signal:</b> {sig['direction']} {stars}\n\n"
+        f"📊 <b>Signal:</b> {sig['direction']} {stars}\n"
+        f"🎯 <b>Confidence:</b> {sig['confidence']}% {confidence_bar}\n\n"
         "<b>Indicators</b>\n"
         f"RSI: {sig['rsi']}\n"
         f"MACD Hist: {sig['macd_hist']}\n"
@@ -259,7 +301,7 @@ async def auto_signal(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         df = fetch_ohlcv(symbol, tf)
         signal = analyse(df)
-        if abs(signal["score"]) >= 3:
+        if abs(signal["score"]) >= 4:
             text = "🔔 <b>AUTO ALERT</b>\n\n" + format_signal(symbol, tf, signal)
             await ctx.bot.send_message(
                 chat_id=job.chat_id,
@@ -329,7 +371,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Supported coins:</b>\n"
         "BTC ETH BNB SOL XRP ADA\n"
         "DOGE TRX TON MATIC DOT LTC\n"
-        "AVAX LINK UNI ATOM XLM INJ"
+        "AVAX LINK UNI ATOM XLM INJ\n"
+        "APT ARB OP SUI SEI TIA\n"
+        "JUP WIF PEPE SHIB FLOKI BONK\n"
+        "FET RENDER GRT FIL ICP HBAR\n"
+        "VET ALGO NEAR FTM SAND MANA\n"
+        "AXS GALA ENJ CHZ FLOW EGLD\n"
+        "THETA EOS XTZ NEO ZEC DASH\n"
+        "CAKE 1INCH"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
