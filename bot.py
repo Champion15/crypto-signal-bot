@@ -9,7 +9,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # CONFIG
-BOT_TOKEN = "8669805705:AAEeEawbQ5U5d-G2hJGV-fJjHO1r_1IVVJE"
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 WATCH_INTERVAL = 60 * 60
 DEFAULT_TF = "1d"
 
