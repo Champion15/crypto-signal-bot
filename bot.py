@@ -1,6 +1,7 @@
 import logging
-from datetime import datetime
+import time
 import os
+from datetime import datetime
 
 import pandas as pd
 import pandas_ta as ta
@@ -13,6 +14,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8669805705:AAEeEawbQ5U5d-G2hJGV-fJjHO1r_1IVVJE")
 WATCH_INTERVAL = 60 * 60
 DEFAULT_TF = "1d"
+
+SUPPORTED_TF = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 COINGECKO_IDS = {
     "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
@@ -36,12 +39,6 @@ COINGECKO_IDS = {
     "CAKE": "pancakeswap-token", "1INCH": "1inch",
 }
 
-INTERVAL_DAYS = {
-    "1h": 7,
-    "4h": 30,
-    "1d": 180,
-}
-
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
@@ -49,27 +46,128 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def fetch_ohlcv(symbol, interval="1d"):
+# ── KUCOIN ────────────────────────────────────────────────────────────────────
+
+def fetch_kucoin(symbol, interval="1d"):
+    tf_map = {
+        "1m": "1min", "5m": "5min", "15m": "15min",
+        "1h": "1hour", "4h": "4hour", "1d": "1day",
+    }
+    pair = symbol.upper() + "-USDT"
+    params = {"symbol": pair, "type": tf_map.get(interval, "1day")}
+    r = requests.get("https://api.kucoin.com/api/v1/market/candles", params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "200000":
+        raise ValueError(f"KuCoin: {data.get('msg')}")
+    candles = data["data"]
+    if not candles or len(candles) < 15:
+        raise ValueError(f"KuCoin: not enough candles ({len(candles) if candles else 0})")
+    df = pd.DataFrame(candles, columns=["ts", "open", "close", "high", "low", "volume", "turnover"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="s")
+    df = df.sort_values("ts").set_index("ts")
+    df.dropna(inplace=True)
+    log.info(f"KuCoin: {len(df)} candles for {pair} ({interval})")
+    return df
+
+
+# ── MEXC ──────────────────────────────────────────────────────────────────────
+
+def fetch_mexc(symbol, interval="1d"):
+    tf_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "1h": "1h", "4h": "4h", "1d": "1d",
+    }
+    pair = symbol.upper() + "USDT"
+    params = {"symbol": pair, "interval": tf_map.get(interval, "1d"), "limit": 200}
+    r = requests.get("https://api.mexc.com/api/v3/klines", params=params, timeout=15)
+    r.raise_for_status()
+    candles = r.json()
+    if not candles or len(candles) < 15:
+        raise ValueError(f"MEXC: not enough candles ({len(candles) if candles else 0})")
+    df = pd.DataFrame(candles, columns=[
+        "ts", "open", "high", "low", "close", "volume",
+        "close_ts", "quote_vol", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore"
+    ])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    df = df.sort_values("ts").set_index("ts")
+    df.dropna(inplace=True)
+    log.info(f"MEXC: {len(df)} candles for {pair} ({interval})")
+    return df
+
+
+# ── GATE.IO ───────────────────────────────────────────────────────────────────
+
+def fetch_gate(symbol, interval="1d"):
+    tf_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "1h": "1h", "4h": "4h", "1d": "1d",
+    }
+    pair = symbol.upper() + "_USDT"
+    params = {"currency_pair": pair, "interval": tf_map.get(interval, "1d"), "limit": 200}
+    r = requests.get("https://api.gateio.ws/api/v4/spot/candlesticks", params=params, timeout=15)
+    r.raise_for_status()
+    candles = r.json()
+    if not candles or len(candles) < 15:
+        raise ValueError(f"Gate.io: not enough candles ({len(candles) if candles else 0})")
+    df = pd.DataFrame(candles, columns=["ts", "volume", "close", "high", "low", "open", "base_volume", "is_closed"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="s")
+    df = df.sort_values("ts").set_index("ts")
+    df.dropna(inplace=True)
+    log.info(f"Gate.io: {len(df)} candles for {pair} ({interval})")
+    return df
+
+
+# ── OKX ──────────────────────────────────────────────────────────────────────
+
+def fetch_okx(symbol, interval="1d"):
+    tf_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m",
+        "1h": "1H", "4h": "4H", "1d": "1D",
+    }
+    pair = symbol.upper() + "-USDT"
+    params = {"instId": pair, "bar": tf_map.get(interval, "1D"), "limit": 200}
+    r = requests.get("https://www.okx.com/api/v5/market/candles", params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "0":
+        raise ValueError(f"OKX: {data.get('msg')}")
+    candles = data["data"]
+    if not candles or len(candles) < 15:
+        raise ValueError(f"OKX: not enough candles ({len(candles) if candles else 0})")
+    df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="ms")
+    df["volume"] = pd.to_numeric(df["vol"], errors="coerce")
+    df = df.sort_values("ts").set_index("ts")
+    df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+    log.info(f"OKX: {len(df)} candles for {pair} ({interval})")
+    return df
+
+
+# ── COINGECKO FALLBACK ────────────────────────────────────────────────────────
+
+def fetch_coingecko(symbol, interval="1d"):
     coin_id = COINGECKO_IDS.get(symbol.upper())
     if not coin_id:
-        supported = ", ".join(COINGECKO_IDS.keys())
-        raise ValueError(f"Unknown symbol. Supported: {supported}")
-
-    days = INTERVAL_DAYS.get(interval, 180)
+        raise ValueError(f"Unknown symbol: {symbol}")
+    days_map = {"1h": 7, "4h": 14, "1d": 30}
+    days = days_map.get(interval, 30)
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-    response = requests.get(
-        url,
-        params={"vs_currency": "usd", "days": days},
-        timeout=20
-    )
-    response.raise_for_status()
-    data = response.json()
-
-    log.info(f"CoinGecko returned {len(data)} candles for {coin_id} ({interval})")
-
+    time.sleep(2)
+    r = requests.get(url, params={"vs_currency": "usd", "days": days}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
     if not data or len(data) < 15:
-        raise ValueError(f"Not enough data returned ({len(data) if data else 0} candles)")
-
+        raise ValueError(f"CoinGecko: not enough candles ({len(data) if data else 0})")
     df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
     df["volume"] = 0.0
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
@@ -77,8 +175,39 @@ def fetch_ohlcv(symbol, interval="1d"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.sort_values("ts").set_index("ts")
     df.dropna(inplace=True)
+    log.info(f"CoinGecko: {len(df)} candles for {coin_id} ({interval})")
     return df
 
+
+# ── MAIN FETCH — tries all sources automatically ──────────────────────────────
+
+def fetch_ohlcv(symbol, interval="1d"):
+    sources = [
+        ("KuCoin", fetch_kucoin),
+        ("MEXC", fetch_mexc),
+        ("Gate.io", fetch_gate),
+        ("OKX", fetch_okx),
+    ]
+    last_error = None
+    for name, fetch_fn in sources:
+        try:
+            return fetch_fn(symbol, interval)
+        except Exception as e:
+            log.warning(f"{name} failed: {e}")
+            last_error = e
+            time.sleep(1)
+
+    # Last resort — CoinGecko for higher timeframes only
+    if interval in ["1h", "4h", "1d"]:
+        try:
+            return fetch_coingecko(symbol, interval)
+        except Exception as e:
+            last_error = e
+
+    raise ValueError(f"All data sources failed. Last error: {last_error}")
+
+
+# ── ANALYSIS ──────────────────────────────────────────────────────────────────
 
 def analyse(df):
     close = df["close"]
@@ -131,16 +260,12 @@ def analyse(df):
     bearish_ema = ema20 < ema50 < ema200
     macd_bull = macd_val > macd_sig
     macd_bear = macd_val < macd_sig
-
     price_above_ema = price > ema20 > ema50
     price_below_ema = price < ema20 < ema50
-
     rsi_bullish = 50 < rsi < 75
     rsi_bearish = rsi < 50
     rsi_overbought = rsi > 75
     rsi_oversold = rsi < 25
-
-    bb_squeeze = (bb_up - bb_low) / bb_mid < 0.1
     price_near_bb_low = price < bb_low * 1.02
     price_near_bb_up = price > bb_up * 0.98
 
@@ -229,6 +354,8 @@ def analyse(df):
     }
 
 
+# ── FORMAT MESSAGE ────────────────────────────────────────────────────────────
+
 def format_signal(symbol, tf, sig):
     stars = "⭐" * abs(sig["score"])
     confidence_bar = "🟩" * (sig["confidence"] // 20) + "⬜" * (5 - sig["confidence"] // 20)
@@ -273,17 +400,20 @@ def format_signal(symbol, tf, sig):
     return text
 
 
+# ── BOT HANDLERS ──────────────────────────────────────────────────────────────
+
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args:
-        await update.message.reply_text("Usage:\n/signal BTC\n/signal ETH 4h")
+        await update.message.reply_text("Usage:\n/signal BTC\n/signal ETH 15m")
         return
     symbol = args[0].upper().replace("USDT", "")
     tf = args[1].lower() if len(args) > 1 else DEFAULT_TF
-    if tf not in INTERVAL_DAYS:
-        await update.message.reply_text("Supported timeframes: 1h, 4h, 1d")
+    if tf not in SUPPORTED_TF:
+        await update.message.reply_text("Supported timeframes:\n1m, 5m, 15m, 1h, 4h, 1d")
         return
-    await update.message.reply_text(f"⏳ Analysing {symbol}/USDT...")
+    log.info(f"Timeframe selected: {tf}")
+    await update.message.reply_text(f"⏳ Analysing {symbol}/USDT on {tf}...")
     try:
         df = fetch_ohlcv(symbol, tf)
         signal = analyse(df)
@@ -363,11 +493,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 <b>Crypto Signal Bot</b>\n\n"
         "/signal BTC\n"
-        "/signal ETH 4h\n\n"
+        "/signal ETH 15m\n"
+        "/signal SOL 1h\n\n"
         "/watch BTC\n"
         "/unwatch BTC\n"
         "/list\n\n"
-        "<b>Timeframes:</b> 1h, 4h, 1d\n\n"
+        "<b>Timeframes:</b>\n"
+        "1m, 5m, 15m, 1h, 4h, 1d\n\n"
         "<b>Supported coins:</b>\n"
         "BTC ETH BNB SOL XRP ADA\n"
         "DOGE TRX TON MATIC DOT LTC\n"
@@ -382,6 +514,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
