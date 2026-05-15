@@ -6,38 +6,17 @@ from datetime import datetime
 import pandas as pd
 import pandas_ta as ta
 import requests
-from telegram import Update
+import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # CONFIG
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8669805705:AAEeEawbQ5U5d-G2hJGV-fJjHO1r_1IVVJE")
-WATCH_INTERVAL = 60 * 60
-DEFAULT_TF = "1d"
+ALERT_INTERVAL = 30 * 60          # 30 minutes
+DEFAULT_TF = "15m"
 
 SUPPORTED_TF = ["1m", "5m", "15m", "1h", "4h", "1d"]
-
-COINGECKO_IDS = {
-    "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-    "SOL": "solana", "XRP": "ripple", "ADA": "cardano",
-    "DOGE": "dogecoin", "TRX": "tron", "TON": "the-open-network",
-    "MATIC": "matic-network", "DOT": "polkadot", "LTC": "litecoin",
-    "AVAX": "avalanche-2", "LINK": "chainlink", "UNI": "uniswap",
-    "ATOM": "cosmos", "XLM": "stellar", "INJ": "injective-protocol",
-    "APT": "aptos", "ARB": "arbitrum", "OP": "optimism",
-    "SUI": "sui", "SEI": "sei-network", "TIA": "celestia",
-    "JUP": "jupiter-ag", "WIF": "dogwifcoin", "PEPE": "pepe",
-    "SHIB": "shiba-inu", "FLOKI": "floki", "BONK": "bonk",
-    "FET": "fetch-ai", "RENDER": "render-token", "GRT": "the-graph",
-    "FIL": "filecoin", "ICP": "internet-computer", "HBAR": "hedera-hashgraph",
-    "VET": "vechain", "ALGO": "algorand", "NEAR": "near",
-    "FTM": "fantom", "SAND": "the-sandbox", "MANA": "decentraland",
-    "AXS": "axie-infinity", "GALA": "gala", "ENJ": "enjincoin",
-    "CHZ": "chiliz", "FLOW": "flow", "EGLD": "elrond-erd-2",
-    "THETA": "theta-token", "EOS": "eos", "XTZ": "tezos",
-    "NEO": "neo", "ZEC": "zcash", "DASH": "dash",
-    "CAKE": "pancakeswap-token", "1INCH": "1inch",
-}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -46,8 +25,75 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── KUCOIN ────────────────────────────────────────────────────────────────────
+# ========================= DATABASE FOR TRADE JOURNAL =========================
+def init_db():
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    coin TEXT,
+                    direction TEXT,
+                    entry_price REAL,
+                    exit_price REAL,
+                    entry_time TEXT,
+                    exit_time TEXT,
+                    pnl_percent REAL,
+                    grade INTEGER,
+                    feedback TEXT,
+                    status TEXT DEFAULT 'OPEN'
+                 )''')
+    conn.commit()
+    conn.close()
 
+def save_trade(coin, direction, entry_price, confidence=0):
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("""INSERT INTO trades 
+                 (coin, direction, entry_price, entry_time, confidence, status)
+                 VALUES (?, ?, ?, ?, ?, 'OPEN')""",
+              (coin.upper(), direction.upper(), entry_price, datetime.utcnow().isoformat(), confidence))
+    conn.commit()
+    trade_id = c.lastrowid
+    conn.close()
+    return trade_id
+
+def close_trade(trade_id, exit_price, feedback=""):
+    conn = sqlite3.connect('trades.db')
+    c = conn.cursor()
+    c.execute("SELECT entry_price, direction FROM trades WHERE id=?", (trade_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    entry = row[0]
+    direction = row[1]
+    if direction == "LONG":
+        pnl_percent = ((exit_price - entry) / entry) * 100
+    else:
+        pnl_percent = ((entry - exit_price) / entry) * 100
+    
+    if pnl_percent >= 10: grade = 10
+    elif pnl_percent >= 6: grade = 9
+    elif pnl_percent >= 3: grade = 7
+    elif pnl_percent >= 0: grade = 5
+    elif pnl_percent >= -5: grade = 3
+    else: grade = 1
+    
+    c.execute("""UPDATE trades SET 
+                 exit_price=?, exit_time=?, pnl_percent=?, grade=?, feedback=?, status='CLOSED'
+                 WHERE id=?""",
+              (exit_price, datetime.utcnow().isoformat(), round(pnl_percent, 2), grade, feedback, trade_id))
+    conn.commit()
+    conn.close()
+    return grade, round(pnl_percent, 2)
+
+def get_all_trades():
+    conn = sqlite3.connect('trades.db')
+    df = pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+
+# ── KUCOIN ────────────────────────────────────────────────────────────────────
 def fetch_kucoin(symbol, interval="1d"):
     tf_map = {
         "1m": "1min", "5m": "5min", "15m": "15min",
@@ -74,7 +120,6 @@ def fetch_kucoin(symbol, interval="1d"):
 
 
 # ── MEXC ──────────────────────────────────────────────────────────────────────
-
 def fetch_mexc(symbol, interval="1d"):
     tf_map = {
         "1m": "1m", "5m": "5m", "15m": "15m",
@@ -102,7 +147,6 @@ def fetch_mexc(symbol, interval="1d"):
 
 
 # ── GATE.IO ───────────────────────────────────────────────────────────────────
-
 def fetch_gate(symbol, interval="1d"):
     tf_map = {
         "1m": "1m", "5m": "5m", "15m": "15m",
@@ -126,7 +170,6 @@ def fetch_gate(symbol, interval="1d"):
 
 
 # ── OKX ──────────────────────────────────────────────────────────────────────
-
 def fetch_okx(symbol, interval="1d"):
     tf_map = {
         "1m": "1m", "5m": "5m", "15m": "15m",
@@ -153,34 +196,7 @@ def fetch_okx(symbol, interval="1d"):
     return df
 
 
-# ── COINGECKO FALLBACK ────────────────────────────────────────────────────────
-
-def fetch_coingecko(symbol, interval="1d"):
-    coin_id = COINGECKO_IDS.get(symbol.upper())
-    if not coin_id:
-        raise ValueError(f"Unknown symbol: {symbol}")
-    days_map = {"1h": 7, "4h": 14, "1d": 30}
-    days = days_map.get(interval, 30)
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-    time.sleep(2)
-    r = requests.get(url, params={"vs_currency": "usd", "days": days}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if not data or len(data) < 15:
-        raise ValueError(f"CoinGecko: not enough candles ({len(data) if data else 0})")
-    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close"])
-    df["volume"] = 0.0
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.sort_values("ts").set_index("ts")
-    df.dropna(inplace=True)
-    log.info(f"CoinGecko: {len(df)} candles for {coin_id} ({interval})")
-    return df
-
-
-# ── MAIN FETCH — tries all sources automatically ──────────────────────────────
-
+# ── MAIN FETCH ────────────────────────────────────────────────────────────────
 def fetch_ohlcv(symbol, interval="1d"):
     sources = [
         ("KuCoin", fetch_kucoin),
@@ -196,19 +212,10 @@ def fetch_ohlcv(symbol, interval="1d"):
             log.warning(f"{name} failed: {e}")
             last_error = e
             time.sleep(1)
-
-    # Last resort — CoinGecko for higher timeframes only
-    if interval in ["1h", "4h", "1d"]:
-        try:
-            return fetch_coingecko(symbol, interval)
-        except Exception as e:
-            last_error = e
-
-    raise ValueError(f"All data sources failed. Last error: {last_error}")
+    raise ValueError(f"All sources failed. Last error: {last_error}")
 
 
 # ── ANALYSIS ──────────────────────────────────────────────────────────────────
-
 def analyse(df):
     close = df["close"]
     high = df["high"]
@@ -222,19 +229,12 @@ def analyse(df):
     df["atr"] = ta.atr(high, low, close, length=7)
 
     macd = ta.macd(close, fast=6, slow=13, signal=5)
-    if macd is None or macd.empty:
-        raise ValueError("MACD calculation failed")
-    df["macd"] = macd["MACD_6_13_5"]
-    df["macd_signal"] = macd["MACDs_6_13_5"]
-    df["macd_hist"] = macd["MACDh_6_13_5"]
+    if macd is not None and not macd.empty:
+        df = pd.concat([df, macd], axis=1)
 
     bb = ta.bbands(close, length=10)
-    if bb is None or bb.empty:
-        raise ValueError("Bollinger Band calculation failed")
-    bb_cols = bb.columns.tolist()
-    df["bb_low"] = bb[bb_cols[0]]
-    df["bb_mid"] = bb[bb_cols[1]]
-    df["bb_up"] = bb[bb_cols[2]]
+    if bb is not None and not bb.empty:
+        df = pd.concat([df, bb], axis=1)
 
     df.dropna(inplace=True)
     log.info(f"Rows after dropna: {len(df)}")
@@ -250,62 +250,23 @@ def analyse(df):
     ema20 = float(latest["ema20"])
     ema50 = float(latest["ema50"])
     ema200 = float(latest["ema200"])
-    macd_val = float(latest["macd"])
-    macd_sig = float(latest["macd_signal"])
-    bb_up = float(latest["bb_up"])
-    bb_low = float(latest["bb_low"])
-    bb_mid = float(latest["bb_mid"])
+    macd_val = float(latest.get("MACD_6_13_5", 0))
+    macd_sig = float(latest.get("MACDs_6_13_5", 0))
 
     bullish_ema = ema20 > ema50 > ema200
     bearish_ema = ema20 < ema50 < ema200
     macd_bull = macd_val > macd_sig
-    macd_bear = macd_val < macd_sig
     price_above_ema = price > ema20 > ema50
-    price_below_ema = price < ema20 < ema50
-    rsi_bullish = 50 < rsi < 75
-    rsi_bearish = rsi < 50
-    rsi_overbought = rsi > 75
-    rsi_oversold = rsi < 25
-    price_near_bb_low = price < bb_low * 1.02
-    price_near_bb_up = price > bb_up * 0.98
 
     score = 0
+    if bullish_ema: score += 2
+    elif bearish_ema: score -= 2
+    if macd_bull and macd_val > 0: score += 2
+    elif macd_bull: score += 1
+    if rsi > 50 and bullish_ema: score += 1
+    if price_above_ema: score += 1
 
-    if bullish_ema:
-        score += 2
-    elif bearish_ema:
-        score -= 2
-
-    if macd_bull and macd_val > 0:
-        score += 2
-    elif macd_bull:
-        score += 1
-    elif macd_bear and macd_val < 0:
-        score -= 2
-    elif macd_bear:
-        score -= 1
-
-    if rsi_bullish and bullish_ema:
-        score += 1
-    elif rsi_oversold:
-        score += 1
-    elif rsi_bearish and bearish_ema:
-        score -= 1
-    elif rsi_overbought:
-        score -= 1
-
-    if price_above_ema:
-        score += 1
-    elif price_below_ema:
-        score -= 1
-
-    if price_near_bb_low and bullish_ema:
-        score += 1
-    elif price_near_bb_up and bearish_ema:
-        score -= 1
-
-    max_score = 7
-    confidence = round((abs(score) / max_score) * 100)
+    confidence = round((abs(score) / 7) * 100)
 
     if score >= 4:
         direction = "LONG 📈"
@@ -348,14 +309,11 @@ def analyse(df):
         "tp2": tp2,
         "tp3": tp3,
         "rr": rr,
-        "macd_hist": round(float(latest["macd_hist"]), 4),
-        "bb_low": round(bb_low, 4),
-        "bb_up": round(bb_up, 4),
+        "macd_hist": round(macd_val - macd_sig, 4) if 'macd_hist' in locals() else 0,
     }
 
 
 # ── FORMAT MESSAGE ────────────────────────────────────────────────────────────
-
 def format_signal(symbol, tf, sig):
     stars = "⭐" * abs(sig["score"])
     confidence_bar = "🟩" * (sig["confidence"] // 20) + "⬜" * (5 - sig["confidence"] // 20)
@@ -370,16 +328,13 @@ def format_signal(symbol, tf, sig):
         f"🎯 <b>Confidence:</b> {sig['confidence']}% {confidence_bar}\n\n"
         "<b>Indicators</b>\n"
         f"RSI: {sig['rsi']}\n"
-        f"MACD Hist: {sig['macd_hist']}\n"
         f"EMA Short: {sig['ema20']}\n"
         f"EMA Mid: {sig['ema50']}\n"
-        f"ATR: {sig['atr']}\n"
-        f"BB Low: {sig['bb_low']}\n"
-        f"BB Up: {sig['bb_up']}\n\n"
+        f"ATR: {sig['atr']}\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
     )
 
-    if sig["entry"]:
+    if sig.get("entry"):
         text += (
             "<b>Trade Setup</b>\n\n"
             f"🎯 Entry: {sig['entry']}\n"
@@ -390,18 +345,123 @@ def format_signal(symbol, tf, sig):
             f"📐 Risk Reward: 1:{sig['rr']}\n\n"
             "━━━━━━━━━━━━━━━━━━"
         )
-    else:
-        text += (
-            "⚠️ No strong setup yet.\n"
-            "Wait for confirmation.\n\n"
-            "━━━━━━━━━━━━━━━━━━"
-        )
-
     return text
 
 
-# ── BOT HANDLERS ──────────────────────────────────────────────────────────────
+# ── INTERACTIVE MENU ─────────────────────────────────────────────────────────
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("🔎 Scanning", callback_data="menu_scanning"),
+         InlineKeyboardButton("🔔 Alerts", callback_data="menu_alerts")],
+        [InlineKeyboardButton("📊 Performance", callback_data="menu_performance"),
+         InlineKeyboardButton("ℹ️ Info", callback_data="menu_info")],
+        [InlineKeyboardButton("💡 Tips", callback_data="menu_tips"),
+         InlineKeyboardButton("❓ Help", callback_data="menu_help")],
+        [InlineKeyboardButton("👤 Contact Owner", callback_data="menu_contact")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
+
+async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = "🤖 **Trading Bot**\n\nWhat would you like to do? Tap a category below 👇"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(text, reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "menu_scanning":
+        await query.edit_message_text("🔎 **Scanning**\n\nUse `/signal BTC 15m`", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "menu_alerts":
+        await query.edit_message_text("🔔 **Alerts**\n\nUse `/watch BTC 15m`", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "menu_performance":
+        await query.edit_message_text("📊 **Performance**\n\nUse `/trades`", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "menu_info":
+        await query.edit_message_text("ℹ️ **Bot Info**\n\nSignal + Trade Journal + Auto Grade", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "menu_tips":
+        await query.edit_message_text("💡 **Tips**\n\nOnly trade when confidence ≥ 80%", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+    elif data == "menu_help":
+        await cmd_help(update, ctx)
+    elif data == "menu_contact":
+        await query.edit_message_text("👤 Contact Owner: @YourUsername", reply_markup=main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+
+# ── TRADE JOURNAL COMMANDS ─────────────────────────────────────────────────────
+async def cmd_newtrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 3:
+        await update.message.reply_text("Usage: `/newtrade BTC LONG 68500`", parse_mode=ParseMode.HTML)
+        return
+    try:
+        coin = ctx.args[0].upper()
+        direction = ctx.args[1].upper()
+        entry_price = float(ctx.args[2])
+        trade_id = save_trade(coin, direction, entry_price)
+        await update.message.reply_text(f"✅ Trade #{trade_id} opened!\n{direction} {coin} @ {entry_price}", parse_mode=ParseMode.HTML)
+    except:
+        await update.message.reply_text("❌ Invalid format.")
+
+
+async def cmd_closetrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: `/closetrade ID EXIT_PRICE`", parse_mode=ParseMode.HTML)
+        return
+    try:
+        trade_id = int(ctx.args[0])
+        exit_price = float(ctx.args[1])
+        feedback = " ".join(ctx.args[2:]) if len(ctx.args) > 2 else ""
+        result = close_trade(trade_id, exit_price, feedback)
+        if result:
+            grade, pnl = result
+            await update.message.reply_text(f"✅ Trade #{trade_id} closed\nP&L: {pnl:+.2f}%\nGrade: {grade}/10 ⭐", parse_mode=ParseMode.HTML)
+    except:
+        await update.message.reply_text("❌ Invalid input.")
+
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    df = get_all_trades()
+    if df.empty:
+        await update.message.reply_text("No trades recorded yet.")
+        return
+    text = "<b>📊 Trade Journal</b>\n\n"
+    for _, row in df.head(10).iterrows():
+        status = "🟢 CLOSED" if row['status'] == 'CLOSED' else "🟡 OPEN"
+        text += f"#{row['id']} | {row['direction']} {row['coin']} | {status}\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ── ALERT (30 MINUTES + ≥80% CONFIDENCE) ─────────────────────────────────────
+async def auto_alert(ctx: ContextTypes.DEFAULT_TYPE):
+    job = ctx.job
+    symbol = job.data["symbol"]
+    tf = job.data.get("tf", DEFAULT_TF)
+    try:
+        df = fetch_ohlcv(symbol, tf)
+        signal = analyse(df)
+        if signal["confidence"] >= 80:
+            text = f"🚨 <b>HIGH CONFIDENCE ALERT</b> — {signal['confidence']}%\n\n" + format_signal(symbol, tf, signal)
+            await ctx.bot.send_message(chat_id=job.chat_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.error(f"Alert error {symbol}: {e}")
+
+
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        await update.message.reply_text("Usage:\n/watch BTC 15m")
+        return
+    symbol = ctx.args[0].upper().replace("USDT", "")
+    tf = ctx.args[1].lower() if len(ctx.args) > 1 else DEFAULT_TF
+    chat_id = update.effective_chat.id
+    job_name = f"alert_{chat_id}_{symbol}"
+    ctx.job_queue.run_repeating(auto_alert, interval=ALERT_INTERVAL, first=10, chat_id=chat_id, name=job_name, data={"symbol": symbol, "tf": tf})
+    await update.message.reply_text(f"✅ Watching {symbol} every 30 mins (≥80% only)")
+
+
+# ── BOT HANDLERS ──────────────────────────────────────────────────────────────
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if not args:
@@ -412,7 +472,6 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tf not in SUPPORTED_TF:
         await update.message.reply_text("Supported timeframes:\n1m, 5m, 15m, 1h, 4h, 1d")
         return
-    log.info(f"Timeframe selected: {tf}")
     await update.message.reply_text(f"⏳ Analysing {symbol}/USDT on {tf}...")
     try:
         df = fetch_ohlcv(symbol, tf)
@@ -424,108 +483,44 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error:\n{str(e)}")
 
 
-async def auto_signal(ctx: ContextTypes.DEFAULT_TYPE):
-    job = ctx.job
-    symbol = job.data["symbol"]
-    tf = job.data["tf"]
-    try:
-        df = fetch_ohlcv(symbol, tf)
-        signal = analyse(df)
-        if abs(signal["score"]) >= 4:
-            text = "🔔 <b>AUTO ALERT</b>\n\n" + format_signal(symbol, tf, signal)
-            await ctx.bot.send_message(
-                chat_id=job.chat_id,
-                text=text,
-                parse_mode=ParseMode.HTML
-            )
-    except Exception as e:
-        log.error(f"Auto signal error: {e}")
-
-
-async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Usage:\n/watch BTC")
-        return
-    symbol = ctx.args[0].upper().replace("USDT", "")
-    chat_id = update.effective_chat.id
-    job_name = f"{chat_id}_{symbol}"
-    if ctx.job_queue.get_jobs_by_name(job_name):
-        await update.message.reply_text(f"Already watching {symbol}")
-        return
-    ctx.job_queue.run_repeating(
-        auto_signal, interval=WATCH_INTERVAL, first=10,
-        chat_id=chat_id, name=job_name,
-        data={"symbol": symbol, "tf": DEFAULT_TF}
-    )
-    await update.message.reply_text(f"👁 Watching {symbol}/USDT")
-
-
-async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Usage:\n/unwatch BTC")
-        return
-    symbol = ctx.args[0].upper().replace("USDT", "")
-    chat_id = update.effective_chat.id
-    job_name = f"{chat_id}_{symbol}"
-    jobs = ctx.job_queue.get_jobs_by_name(job_name)
-    if not jobs:
-        await update.message.reply_text(f"{symbol} not being watched")
-        return
-    for job in jobs:
-        job.schedule_removal()
-    await update.message.reply_text(f"🔕 Stopped watching {symbol}")
-
-
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    watched = [
-        job.name.replace(f"{chat_id}_", "")
-        for job in ctx.job_queue.jobs()
-        if job.name and job.name.startswith(str(chat_id))
-    ]
-    if watched:
-        await update.message.reply_text("👁 Watching:\n" + "\n".join(watched))
-    else:
-        await update.message.reply_text("No active watchlist")
-
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🤖 <b>Crypto Signal Bot</b>\n\n"
-        "/signal BTC\n"
-        "/signal ETH 15m\n"
-        "/signal SOL 1h\n\n"
-        "/watch BTC\n"
-        "/unwatch BTC\n"
-        "/list\n\n"
-        "<b>Timeframes:</b>\n"
-        "1m, 5m, 15m, 1h, 4h, 1d\n\n"
-        "<b>Supported coins:</b>\n"
-        "BTC ETH BNB SOL XRP ADA\n"
-        "DOGE TRX TON MATIC DOT LTC\n"
-        "AVAX LINK UNI ATOM XLM INJ\n"
-        "APT ARB OP SUI SEI TIA\n"
-        "JUP WIF PEPE SHIB FLOKI BONK\n"
-        "FET RENDER GRT FIL ICP HBAR\n"
-        "VET ALGO NEAR FTM SAND MANA\n"
-        "AXS GALA ENJ CHZ FLOW EGLD\n"
-        "THETA EOS XTZ NEO ZEC DASH\n"
-        "CAKE 1INCH"
+        "🤖 <b>Crypto Signal Bot + Trade Journal</b>\n\n"
+        "Use /menu to open the beautiful menu"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+# ── POST INIT ────────────────────────────────────────────────────────────────
+async def post_init(application: Application) -> None:
+    await application.bot.delete_my_commands()
+    await application.bot.set_my_commands([
+        ("start", "Open Main Menu"),
+        ("menu", "Show Menu"),
+        ("signal", "Get Signal"),
+        ("newtrade", "Record Trade"),
+        ("closetrade", "Close Trade"),
+        ("trades", "View Trades"),
+        ("watch", "Start Alerts"),
+    ])
 
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_help))
-    app.add_handler(CommandHandler("help", cmd_help))
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    
+    app.add_handler(CommandHandler("start", show_menu))
+    app.add_handler(CommandHandler("menu", show_menu))
     app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("newtrade", cmd_newtrade))
+    app.add_handler(CommandHandler("closetrade", cmd_closetrade))
+    app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("watch", cmd_watch))
-    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
-    app.add_handler(CommandHandler("list", cmd_list))
-    log.info("Bot started...")
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    log.info("🚀 Full Bot Started with Menu + Trade Journal + 30min Alerts")
     app.run_polling()
 
 
