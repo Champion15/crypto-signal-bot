@@ -648,6 +648,8 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── POST INIT ─────────────────────────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
+    # Clear any old/broken commands first, then set the correct ones
+    await app.bot.delete_my_commands()
     await app.bot.set_my_commands([
         ("start",   "Show main menu"),
         ("signal",  "Get signal  e.g. /signal BTC 15m"),
@@ -655,6 +657,7 @@ async def post_init(app: Application) -> None:
         ("unwatch", "Stop alerts e.g. /unwatch BTC"),
         ("list",    "Show watched coins"),
     ])
+    log.info("Bot commands set ✅")
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
